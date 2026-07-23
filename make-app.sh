@@ -1,9 +1,29 @@
 #!/bin/bash
+# Usage:
+#   ./make-app.sh          build for this Mac, install to /Applications, launch
+#   ./make-app.sh --dist   build a universal dist/Figurehead.app plus a .zip and .dmg
+#
+# The version comes from the VERSION file; VERSION=x.y.z in the environment
+# overrides it, which is how the release workflow stamps a build.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "› Building release binary…"
-swift build -c release
+DIST=0
+[ "${1:-}" = "--dist" ] && DIST=1
+SHORT_VERSION="${VERSION:-$(tr -d '[:space:]' < VERSION 2>/dev/null || echo 0.1.0)}"
+
+if [ "$DIST" = "1" ]; then
+  # Anything people download has to run on both architectures — an arm64-only
+  # binary is a broken download for every Intel Mac. The local install path
+  # stays single-arch because it only ever has to run on this machine.
+  echo "› Building universal release binary…"
+  swift build -c release --arch arm64 --arch x86_64
+  BINARY=".build/apple/Products/Release/Figurehead"
+else
+  echo "› Building release binary…"
+  swift build -c release
+  BINARY=".build/release/Figurehead"
+fi
 
 if [ ! -f AppIcon.icns ] || [ make-icon.swift -nt AppIcon.icns ]; then
   echo "› Generating AppIcon.icns…"
@@ -14,10 +34,10 @@ STAGE="$(mktemp -d)"
 APP="$STAGE/Figurehead.app"
 echo "› Assembling in staging: $APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/Figurehead "$APP/Contents/MacOS/Figurehead"
-cp AppIcon.icns              "$APP/Contents/Resources/AppIcon.icns"
+cp "$BINARY"     "$APP/Contents/MacOS/Figurehead"
+cp AppIcon.icns  "$APP/Contents/Resources/AppIcon.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -26,7 +46,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>          <string>Figurehead</string>
     <key>CFBundleIdentifier</key>           <string>com.tomshafer.figurehead</string>
     <key>CFBundleVersion</key>              <string>1</string>
-    <key>CFBundleShortVersionString</key>   <string>0.1</string>
+    <key>CFBundleShortVersionString</key>   <string>${SHORT_VERSION}</string>
     <key>CFBundleExecutable</key>           <string>Figurehead</string>
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>CFBundleSupportedPlatforms</key>   <array><string>MacOSX</string></array>
@@ -42,12 +62,37 @@ PLIST
 xattr -cr "$APP" 2>/dev/null || true
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
-DEST="/Applications/Figurehead.app"
-echo "› Installing to $DEST"
-/usr/bin/pkill -x Figurehead 2>/dev/null || true
-/bin/sleep 0.3
-rm -rf "$DEST"
-/bin/mv "$APP" "$DEST"
-rm -rf "$STAGE"
-open "$DEST"
-echo "› Installed and launched: $DEST"
+if [ "$DIST" = "1" ]; then
+  rm -rf dist
+  mkdir -p dist
+  /bin/mv "$APP" dist/Figurehead.app
+  rm -rf "$STAGE"
+
+  echo "› Packaging dist/Figurehead-${SHORT_VERSION}.zip"
+  /usr/bin/ditto -c -k --keepParent dist/Figurehead.app "dist/Figurehead-${SHORT_VERSION}.zip"
+
+  # A DMG alongside the zip: it opens to a window holding Figurehead.app next to an
+  # /Applications alias, so installing is one drag rather than "unzip, then
+  # find where it went". UDZO is compressed and read-only.
+  echo "› Packaging dist/Figurehead-${SHORT_VERSION}.dmg"
+  DMG_ROOT="$(mktemp -d)"
+  /bin/cp -R dist/Figurehead.app "$DMG_ROOT/Figurehead.app"
+  /bin/ln -s /Applications "$DMG_ROOT/Applications"
+  /usr/bin/hdiutil create \
+    -volname "Figurehead ${SHORT_VERSION}" \
+    -srcfolder "$DMG_ROOT" \
+    -fs HFS+ -format UDZO -ov -quiet \
+    "dist/Figurehead-${SHORT_VERSION}.dmg"
+  rm -rf "$DMG_ROOT"
+  echo "› Packaged: dist/Figurehead-${SHORT_VERSION}.dmg"
+else
+  DEST="/Applications/Figurehead.app"
+  echo "› Installing to $DEST"
+  /usr/bin/pkill -x Figurehead 2>/dev/null || true
+  /bin/sleep 0.3
+  rm -rf "$DEST"
+  /bin/mv "$APP" "$DEST"
+  rm -rf "$STAGE"
+  open "$DEST"
+  echo "› Installed and launched: $DEST"
+fi
